@@ -22,12 +22,20 @@
 (define-constant ERR_CIRCUIT_BREAKER_ACTIVE (err u104))
 (define-constant ERR_INVALID_TIMESTAMP (err u105))
 (define-constant ERR_DUPLICATE_SUBMISSION (err u106))
+(define-constant ERR_OVERFLOW (err u107))
+(define-constant ERR_UNDERFLOW (err u108))
+(define-constant ERR_RATE_LIMIT_EXCEEDED (err u109))
+(define-constant ERR_INVALID_INPUT (err u110))
+(define-constant ERR_PRICE_DEVIATION_TOO_HIGH (err u111))
 
 (define-constant MIN_BURN_AMOUNT u1000000) ;; 1 STX minimum
 (define-constant MAX_PRICE_DEVIATION u20) ;; 20% max deviation
 (define-constant CONSENSUS_WINDOW u10) ;; 10 block consensus window
 (define-constant REPUTATION_MULTIPLIER_BASE u100)
 (define-constant SLASH_PERCENTAGE u50) ;; 50% slash for bad data
+(define-constant RATE_LIMIT_BLOCKS u5) ;; Minimum blocks between submissions
+(define-constant MAX_REPUTATION_SCORE u300)
+(define-constant MIN_REPUTATION_SCORE u10)
 
 ;; data vars
 (define-data-var contract-paused bool false)
@@ -88,6 +96,37 @@
   }
 )
 
+;; Security helper functions
+
+(define-private (safe-add (a uint) (b uint))
+  (let ((result (+ a b)))
+    (asserts! (>= result a) ERR_OVERFLOW)
+    (ok result)))
+
+(define-private (safe-sub (a uint) (b uint))
+  (if (>= a b)
+    (ok (- a b))
+    ERR_UNDERFLOW))
+
+(define-private (safe-mul (a uint) (b uint))
+  (let ((result (* a b)))
+    (asserts! (or (is-eq b u0) (is-eq (/ result b) a)) ERR_OVERFLOW)
+    (ok result)))
+
+(define-private (safe-div (a uint) (b uint))
+  (if (> b u0)
+    (ok (/ a b))
+    ERR_INVALID_AMOUNT))
+
+(define-private (check-rate-limit (oracle principal) (last-block uint))
+  (let ((current-block stacks-block-height))
+    (asserts! (>= (- current-block last-block) RATE_LIMIT_BLOCKS) ERR_RATE_LIMIT_EXCEEDED)
+    (ok true)))
+
+(define-private (validate-feed-name (name (string-ascii 64)))
+  (if (> (len name) u0)
+    (ok true)
+    ERR_INVALID_INPUT))
 
 ;; public functions
 
@@ -95,10 +134,12 @@
 (define-public (create-feed (name (string-ascii 64)))
   (let
     (
-      (feed-id (+ (var-get total-feeds-count) u1))
+      (current-count (var-get total-feeds-count))
+      (feed-id (unwrap! (safe-add current-count u1) ERR_OVERFLOW))
     )
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
     (asserts! (not (var-get contract-paused)) ERR_CIRCUIT_BREAKER_ACTIVE)
+    (try! (validate-feed-name name))
     
     (map-set feed-data
       { feed-id: feed-id }
@@ -120,15 +161,15 @@
 (define-public (submit-feed-data (feed-id uint) (price uint) (burn-amount uint))
   (let
     (
-      (current-block u0)
-      (current-timestamp current-block)
+      (current-block stacks-block-height)
+      (current-timestamp stacks-block-height)
       (feed-info (unwrap! (map-get? feed-data { feed-id: feed-id }) ERR_FEED_NOT_FOUND))
       (oracle-rep (default-to 
         { total-submissions: u0, accurate-submissions: u0, total-burned: u0, reputation-score: u100, last-submission-block: u0 }
         (map-get? oracle-reputation { oracle: tx-sender })
       ))
       (reputation-multiplier (calculate-reputation-multiplier (get reputation-score oracle-rep)))
-      (effective-weight (* burn-amount reputation-multiplier))
+      (effective-weight (unwrap! (safe-mul burn-amount reputation-multiplier) ERR_OVERFLOW))
     )
     
     ;; Validations
@@ -138,7 +179,13 @@
     (asserts! (> price u0) ERR_INVALID_AMOUNT)
     (asserts! (is-none (map-get? feed-submissions { feed-id: feed-id, block-height: current-block, submitter: tx-sender })) ERR_DUPLICATE_SUBMISSION)
     
-    ;; Burn STX tokens
+    ;; Rate limiting check
+    (try! (check-rate-limit tx-sender (get last-submission-block oracle-rep)))
+    
+    ;; Price deviation check
+    (asserts! (validate-price-submission feed-id price) ERR_PRICE_DEVIATION_TOO_HIGH)
+    
+    ;; Burn STX tokens (external call first - reentrancy protection)
     (try! (stx-burn? burn-amount tx-sender))
     
     ;; Record submission
@@ -153,35 +200,45 @@
       }
     )
     
-    ;; Update consensus data
+    ;; Update consensus data with safe math
     (let
       (
         (consensus (default-to 
           { total-weight: u0, weighted-price-sum: u0, submission-count: u0, finalized: false }
           (map-get? consensus-data { feed-id: feed-id, block-height: current-block })
         ))
+        (new-total-weight (unwrap! (safe-add (get total-weight consensus) effective-weight) ERR_OVERFLOW))
+        (price-weight (unwrap! (safe-mul price effective-weight) ERR_OVERFLOW))
+        (new-weighted-sum (unwrap! (safe-add (get weighted-price-sum consensus) price-weight) ERR_OVERFLOW))
+        (new-submission-count (unwrap! (safe-add (get submission-count consensus) u1) ERR_OVERFLOW))
       )
       (map-set consensus-data
         { feed-id: feed-id, block-height: current-block }
         {
-          total-weight: (+ (get total-weight consensus) effective-weight),
-          weighted-price-sum: (+ (get weighted-price-sum consensus) (* price effective-weight)),
-          submission-count: (+ (get submission-count consensus) u1),
+          total-weight: new-total-weight,
+          weighted-price-sum: new-weighted-sum,
+          submission-count: new-submission-count,
           finalized: false
         }
       )
     )
     
-    ;; Update oracle reputation
-    (map-set oracle-reputation
-      { oracle: tx-sender }
-      {
-        total-submissions: (+ (get total-submissions oracle-rep) u1),
-        accurate-submissions: (get accurate-submissions oracle-rep),
-        total-burned: (+ (get total-burned oracle-rep) burn-amount),
-        reputation-score: (get reputation-score oracle-rep),
-        last-submission-block: current-block
-      }
+    ;; Update oracle reputation with safe math
+    (let
+      (
+        (new-total-submissions (unwrap! (safe-add (get total-submissions oracle-rep) u1) ERR_OVERFLOW))
+        (new-total-burned (unwrap! (safe-add (get total-burned oracle-rep) burn-amount) ERR_OVERFLOW))
+      )
+      (map-set oracle-reputation
+        { oracle: tx-sender }
+        {
+          total-submissions: new-total-submissions,
+          accurate-submissions: (get accurate-submissions oracle-rep),
+          total-burned: new-total-burned,
+          reputation-score: (get reputation-score oracle-rep),
+          last-submission-block: current-block
+        }
+      )
     )
     
     (ok true)
@@ -194,16 +251,17 @@
     (
       (consensus (unwrap! (map-get? consensus-data { feed-id: feed-id, block-height: blk }) ERR_FEED_NOT_FOUND))
       (feed-info (unwrap! (map-get? feed-data { feed-id: feed-id }) ERR_FEED_NOT_FOUND))
+      (current-block stacks-block-height)
     )
     
     (asserts! (not (get finalized consensus)) ERR_UNAUTHORIZED)
     (asserts! (> (get submission-count consensus) u0) ERR_INVALID_AMOUNT)
-    (asserts! (>= (- blk blk) CONSENSUS_WINDOW) ERR_INVALID_TIMESTAMP)
+    (asserts! (>= (unwrap! (safe-sub current-block blk) ERR_UNDERFLOW) CONSENSUS_WINDOW) ERR_INVALID_TIMESTAMP)
     
     (let
       (
-        (consensus-price (/ (get weighted-price-sum consensus) (get total-weight consensus)))
-        (round-number (+ (get submission-count feed-info) u1))
+        (consensus-price (unwrap! (safe-div (get weighted-price-sum consensus) (get total-weight consensus)) ERR_INVALID_AMOUNT))
+        (round-number (unwrap! (safe-add (get submission-count feed-info) u1) ERR_OVERFLOW))
       )
       
       ;; Update feed data with consensus price
@@ -250,6 +308,7 @@
     )
     
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (not (var-get contract-paused)) ERR_CIRCUIT_BREAKER_ACTIVE)
     (asserts! (not (get slashed submission)) ERR_INVALID_AMOUNT)
     
     ;; Mark submission as slashed
@@ -258,12 +317,20 @@
       (merge submission { slashed: true })
     )
     
-    ;; Reduce oracle reputation
-    (map-set oracle-reputation
-      { oracle: oracle }
-      (merge oracle-rep {
-        reputation-score: (max-uint u10 (- (get reputation-score oracle-rep) u20))
-      })
+    ;; Reduce oracle reputation with safe math
+    (let
+      (
+        (current-score (get reputation-score oracle-rep))
+        (new-score (if (>= current-score u20)
+          (- current-score u20)
+          MIN_REPUTATION_SCORE))
+      )
+      (map-set oracle-reputation
+        { oracle: oracle }
+        (merge oracle-rep {
+          reputation-score: new-score
+        })
+      )
     )
     
     (ok true)
@@ -334,6 +401,19 @@
   })
 )
 
+;; NEW: Security read-only functions
+(define-read-only (is-contract-paused)
+  (var-get contract-paused))
+
+(define-read-only (get-rate-limit-blocks)
+  RATE_LIMIT_BLOCKS)
+
+(define-read-only (get-min-burn-amount)
+  MIN_BURN_AMOUNT)
+
+(define-read-only (get-max-price-deviation)
+  MAX_PRICE_DEVIATION)
+
 ;; Calculate required burn amount based on reputation
 (define-read-only (calculate-required-burn (oracle principal))
   (let
@@ -386,24 +466,34 @@
           (map-get? oracle-reputation { oracle: oracle })
         ))
         (price-deviation (abs-diff submitted-price (get price submission)))
-        (is-accurate (< price-deviation (/ (get price submission) u20))) ;; Within 5% deviation
+        (deviation-threshold (unwrap-panic (safe-div (get price submission) u20)))
+        (is-accurate (< price-deviation deviation-threshold))
       )
       
-      (map-set oracle-reputation
-        { oracle: oracle }
-        {
-          total-submissions: (get total-submissions oracle-rep),
-          accurate-submissions: (if is-accurate 
-            (+ (get accurate-submissions oracle-rep) u1)
+      (let
+        (
+          (current-score (get reputation-score oracle-rep))
+          (new-accurate-count (if is-accurate 
+            (unwrap-panic (safe-add (get accurate-submissions oracle-rep) u1))
             (get accurate-submissions oracle-rep)
-          ),
-          total-burned: (get total-burned oracle-rep),
-          reputation-score: (if is-accurate
-            (min-uint u300 (+ (get reputation-score oracle-rep) u5))
-            (max-uint u10 (- (get reputation-score oracle-rep) u10))
-          ),
-          last-submission-block: (get last-submission-block oracle-rep)
-        }
+          ))
+          (new-reputation-score (if is-accurate
+            (min-uint MAX_REPUTATION_SCORE (unwrap-panic (safe-add current-score u5)))
+            (if (>= current-score u10)
+              (- current-score u10)
+              MIN_REPUTATION_SCORE)
+          ))
+        )
+        (map-set oracle-reputation
+          { oracle: oracle }
+          {
+            total-submissions: (get total-submissions oracle-rep),
+            accurate-submissions: new-accurate-count,
+            total-burned: (get total-burned oracle-rep),
+            reputation-score: new-reputation-score,
+            last-submission-block: (get last-submission-block oracle-rep)
+          }
+        )
       )
       
       (ok true)
@@ -453,10 +543,10 @@
   )
 )
 
-;; Calculate weighted average price
+;; Calculate weighted average price with safe math
 (define-private (calculate-weighted-consensus (total-weight uint) (weighted-sum uint))
   (if (> total-weight u0)
-    (/ weighted-sum total-weight)
+    (unwrap-panic (safe-div weighted-sum total-weight))
     u0
   )
 )
