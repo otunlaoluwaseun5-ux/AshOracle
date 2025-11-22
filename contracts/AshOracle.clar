@@ -28,6 +28,19 @@
 (define-constant ERR_INVALID_INPUT (err u110))
 (define-constant ERR_PRICE_DEVIATION_TOO_HIGH (err u111))
 
+;; ADVANCED SECURITY ERROR CODES
+(define-constant ERR_ORACLE_STALE (err u112))
+(define-constant ERR_ORACLE_INVALID (err u113))
+(define-constant ERR_MULTI_SIG_REQUIRED (err u114))
+(define-constant ERR_TIME_LOCK_ACTIVE (err u115))
+(define-constant ERR_CIRCUIT_BREAKER (err u116))
+(define-constant ERR_SECURITY_VIOLATION (err u117))
+(define-constant ERR_BATCH_LIMIT_EXCEEDED (err u118))
+(define-constant ERR_INVALID_SIGNATURE (err u119))
+(define-constant ERR_OPERATION_BLACKLISTED (err u120))
+(define-constant ERR_ORACLE_BLACKLISTED (err u121))
+(define-constant ERR_MAX_FEEDS_EXCEEDED (err u122))
+
 (define-constant MIN_BURN_AMOUNT u1000000) ;; 1 STX minimum
 (define-constant MAX_PRICE_DEVIATION u20) ;; 20% max deviation
 (define-constant CONSENSUS_WINDOW u10) ;; 10 block consensus window
@@ -36,11 +49,26 @@
 (define-constant RATE_LIMIT_BLOCKS u5) ;; Minimum blocks between submissions
 (define-constant MAX_REPUTATION_SCORE u300)
 (define-constant MIN_REPUTATION_SCORE u10)
-
-;; data vars
+(define-constant ORACLE_VALIDATION_ENABLED true)
+(define-constant MAX_ORACLE_STALENESS u3600) ;; 1 hour in seconds
+(define-constant MULTI_SIG_THRESHOLD u2) ;; Require 2 signatures for critical operations
+(define-constant TIME_LOCK_DURATION u1440) ;; 1 day time lock for critical changes
+(define-constant CIRCUIT_BREAKER_THRESHOLD u10) ;; Max failures before circuit breaker
+(define-constant SECURITY_EVENT_LOG_SIZE u100) ;; Max security events to log
+(define-constant MAX_FEEDS_PER_ORACLE u50) ;; Max feeds an oracle can submit to
+(define-constant ORACLE_BLACKLIST_TIMEOUT u10080) ;; 7 days blacklist timeout
 (define-data-var contract-paused bool false)
 (define-data-var total-feeds-count uint u0)
 (define-data-var emergency-admin principal CONTRACT_OWNER)
+
+;; ADVANCED SECURITY DATA VARS
+(define-data-var oracle-last-update uint u0)
+(define-data-var oracle-data-valid bool true)
+(define-data-var circuit-breaker-active bool false)
+(define-data-var circuit-breaker-failures uint u0)
+(define-data-var time-lock-unlock-block uint u0)
+(define-data-var security-admin principal CONTRACT_OWNER)
+(define-data-var next-event-id uint u1)
 
 ;; data maps
 (define-map feed-data 
@@ -96,6 +124,37 @@
   }
 )
 
+;; ADVANCED SECURITY MAPS
+(define-map oracle-data
+  (string-ascii 32)
+  { value: uint, timestamp: uint, valid: bool }
+)
+
+(define-map multi-sig-signatures
+  { operation-id: uint, signer: principal }
+  { signature: (buff 65), signed-at: uint }
+)
+
+(define-map time-locked-operations
+  uint
+  { operation: (string-ascii 64), unlock-block: uint, executed: bool }
+)
+
+(define-map security-event-log
+  uint
+  { event-type: (string-ascii 32), details: (string-ascii 256), block: uint, actor: principal }
+)
+
+(define-map operation-blacklist
+  (string-ascii 64)
+  bool
+)
+
+(define-map oracle-blacklist
+  { oracle: principal }
+  { reason: (string-ascii 128), blacklist-until: uint, blacklisted-by: principal }
+)
+
 ;; Security helper functions
 
 (define-private (safe-add (a uint) (b uint))
@@ -126,7 +185,100 @@
 (define-private (validate-feed-name (name (string-ascii 64)))
   (if (> (len name) u0)
     (ok true)
-    ERR_INVALID_INPUT))
+    ERR_INVALID_INPUT  )
+)
+
+;; ADVANCED SECURITY FUNCTIONS
+
+;; Validate oracle data freshness
+(define-private (validate-oracle-data (data-key (string-ascii 32)))
+  (if ORACLE_VALIDATION_ENABLED
+    (match (map-get? oracle-data data-key)
+      oracle-entry
+      (if (and
+            (get valid oracle-entry)
+            (< (- stacks-block-height (get timestamp oracle-entry)) MAX_ORACLE_STALENESS))
+        (ok true)
+        ERR_ORACLE_STALE)
+      ERR_ORACLE_INVALID)
+    (ok true))
+)
+
+;; Check circuit breaker status
+(define-private (check-circuit-breaker)
+  (if (var-get circuit-breaker-active)
+    ERR_CIRCUIT_BREAKER
+    (ok true))
+)
+
+;; Check time lock status
+(define-private (check-time-lock)
+  (if (> stacks-block-height (var-get time-lock-unlock-block))
+    (ok true)
+    ERR_TIME_LOCK_ACTIVE)
+)
+
+;; Check if operation is blacklisted
+(define-private (check-operation-blacklist (operation (string-ascii 64)))
+  (if (default-to false (map-get? operation-blacklist operation))
+    ERR_OPERATION_BLACKLISTED
+    (ok true))
+)
+
+;; Check if oracle is blacklisted
+(define-private (check-oracle-blacklist (oracle principal))
+  (match (map-get? oracle-blacklist { oracle: oracle })
+    blacklist-entry
+    (if (> stacks-block-height (get blacklist-until blacklist-entry))
+      (ok true) ;; Blacklist expired
+      ERR_ORACLE_BLACKLISTED)
+    (ok true) ;; Not blacklisted
+  )
+)
+
+;; Log security events
+(define-private (log-security-event (event-type (string-ascii 32)) (details (string-ascii 256)))
+  (let ((event-id (var-get next-event-id)))
+    (map-set security-event-log event-id {
+      event-type: event-type,
+      details: details,
+      block: stacks-block-height,
+      actor: tx-sender
+    })
+    (var-set next-event-id (+ event-id u1))
+  )
+)
+
+;; Update circuit breaker on failures
+(define-private (update-circuit-breaker (operation-failed bool))
+  (if operation-failed
+    (let ((new-failures (+ (var-get circuit-breaker-failures) u1)))
+      (var-set circuit-breaker-failures new-failures)
+      (if (>= new-failures CIRCUIT_BREAKER_THRESHOLD)
+        (var-set circuit-breaker-active true)
+        true)
+    )
+    (begin
+      (var-set circuit-breaker-failures u0)
+      (if (var-get circuit-breaker-active)
+        (var-set circuit-breaker-active false)
+        true)
+    )
+  )
+)
+
+;; Validate oracle reputation requirements
+(define-private (validate-oracle-requirements (oracle principal) (burn-amount uint))
+  (let ((oracle-rep (default-to 
+    { total-submissions: u0, accurate-submissions: u0, total-burned: u0, reputation-score: u100, last-submission-block: u0 }
+    (map-get? oracle-reputation { oracle: oracle })
+  )))
+    (asserts! (>= (get reputation-score oracle-rep) u50) ERR_INVALID_INPUT)
+    (asserts! (>= burn-amount MIN_BURN_AMOUNT) ERR_INSUFFICIENT_BURN)
+    (try! (check-oracle-blacklist oracle))
+    (ok true)
+  )
+)
 
 ;; public functions
 
@@ -137,6 +289,8 @@
       (current-count (var-get total-feeds-count))
       (feed-id (unwrap! (safe-add current-count u1) ERR_OVERFLOW))
     )
+    (try! (check-circuit-breaker))
+    (try! (check-operation-blacklist "create-feed"))
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
     (asserts! (not (var-get contract-paused)) ERR_CIRCUIT_BREAKER_ACTIVE)
     (try! (validate-feed-name name))
@@ -153,6 +307,7 @@
     )
     
     (var-set total-feeds-count feed-id)
+    (log-security-event "feed-created" (concat "Created feed: " name))
     (ok feed-id)
   )
 )
@@ -171,6 +326,11 @@
       (reputation-multiplier (calculate-reputation-multiplier (get reputation-score oracle-rep)))
       (effective-weight (unwrap! (safe-mul burn-amount reputation-multiplier) ERR_OVERFLOW))
     )
+    
+    ;; Advanced security validations
+    (try! (check-circuit-breaker))
+    (try! (check-operation-blacklist "submit-data"))
+    (try! (validate-oracle-requirements tx-sender burn-amount))
     
     ;; Validations
     (asserts! (not (var-get contract-paused)) ERR_CIRCUIT_BREAKER_ACTIVE)
@@ -241,6 +401,8 @@
       )
     )
     
+    (log-security-event "data-submitted" (concat "Price submitted for feed " (int-to-ascii feed-id)))
+    (update-circuit-breaker false) ;; Reset circuit breaker on success
     (ok true)
   )
 )
@@ -355,6 +517,74 @@
   )
 )
 
+;; BATCH OPERATIONS FOR PERFORMANCE
+
+;; Batch submit data to multiple feeds (up to 5)
+(define-public (batch-submit-feed-data (submissions (list 5 { feed-id: uint, price: uint, burn-amount: uint })))
+  (begin
+    (try! (check-circuit-breaker))
+    (try! (check-operation-blacklist "batch-submit"))
+    (asserts! (not (var-get contract-paused)) ERR_CIRCUIT_BREAKER_ACTIVE)
+    (asserts! (<= (len submissions) u5) ERR_BATCH_LIMIT_EXCEEDED)
+
+    (let ((results (map batch-submit-helper submissions)))
+      (log-security-event "batch-submit" (concat "Submitted to " (concat (int-to-ascii (len submissions)) " feeds")))
+      (ok results)
+    )
+  )
+)
+
+;; Batch finalize consensus for multiple feeds
+(define-public (batch-finalize-consensus (finalizations (list 5 { feed-id: uint, block: uint })))
+  (begin
+    (try! (check-circuit-breaker))
+    (try! (check-operation-blacklist "batch-finalize"))
+    (asserts! (<= (len finalizations) u5) ERR_BATCH_LIMIT_EXCEEDED)
+
+    (let ((results (map batch-finalize-helper finalizations)))
+      (log-security-event "batch-finalize" (concat "Finalized " (concat (int-to-ascii (len finalizations)) " consensuses")))
+      (ok results)
+    )
+  )
+)
+
+;; Batch slash oracles
+(define-public (batch-slash-oracles (slashes (list 5 { feed-id: uint, block: uint, oracle: principal })))
+  (begin
+    (try! (check-circuit-breaker))
+    (try! (check-operation-blacklist "batch-slash"))
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (<= (len slashes) u5) ERR_BATCH_LIMIT_EXCEEDED)
+
+    (let ((results (map batch-slash-helper slashes)))
+      (log-security-event "batch-slash" (concat "Slashed " (concat (int-to-ascii (len slashes)) " oracles")))
+      (ok results)
+    )
+  )
+)
+
+;; Helper functions for batch operations
+(define-private (batch-submit-helper (submission { feed-id: uint, price: uint, burn-amount: uint }))
+  (match (submit-feed-data (get feed-id submission) (get price submission) (get burn-amount submission))
+    success u1
+    error u0
+  )
+)
+
+(define-private (batch-finalize-helper (finalization { feed-id: uint, block: uint }))
+  (match (finalize-consensus (get feed-id finalization) (get block finalization))
+    success u1
+    error u0
+  )
+)
+
+(define-private (batch-slash-helper (slash { feed-id: uint, block: uint, oracle: principal }))
+  (match (slash-oracle (get feed-id slash) (get block slash) (get oracle slash))
+    success u1
+    error u0
+  )
+)
+
 ;; read only functions
 
 ;; Get latest price for a feed
@@ -428,6 +658,83 @@
   )
 )
 
+;; ADVANCED SECURITY READ-ONLY FUNCTIONS
+
+;; Get oracle data validation status
+(define-read-only (get-oracle-data (data-key (string-ascii 32)))
+  (map-get? oracle-data data-key)
+)
+
+;; Get circuit breaker status
+(define-read-only (get-circuit-breaker-status)
+  {
+    active: (var-get circuit-breaker-active),
+    failures: (var-get circuit-breaker-failures),
+    threshold: CIRCUIT_BREAKER_THRESHOLD
+  }
+)
+
+;; Get time lock status
+(define-read-only (get-time-lock-status)
+  {
+    unlock-block: (var-get time-lock-unlock-block),
+    current-block: stacks-block-height,
+    locked: (< stacks-block-height (var-get time-lock-unlock-block))
+  }
+)
+
+;; Get security event log
+(define-read-only (get-security-event (event-id uint))
+  (map-get? security-event-log event-id)
+)
+
+;; Check if operation is blacklisted
+(define-read-only (is-operation-blacklisted (operation (string-ascii 64)))
+  (ok (default-to false (map-get? operation-blacklist operation)))
+)
+
+;; Check if oracle is blacklisted
+(define-read-only (is-oracle-blacklisted (oracle principal))
+  (match (map-get? oracle-blacklist { oracle: oracle })
+    blacklist-entry (ok (> stacks-block-height (get blacklist-until blacklist-entry)))
+    (ok false)
+  )
+)
+
+;; Get security admin
+(define-read-only (get-security-admin)
+  (ok (var-get security-admin))
+)
+
+;; Get advanced contract info
+(define-read-only (get-advanced-contract-info)
+  (ok {
+    oracle-validation-enabled: ORACLE_VALIDATION_ENABLED,
+    oracle-last-update: (var-get oracle-last-update),
+    oracle-data-valid: (var-get oracle-data-valid),
+    circuit-breaker-active: (var-get circuit-breaker-active),
+    circuit-breaker-failures: (var-get circuit-breaker-failures),
+    time-lock-unlock-block: (var-get time-lock-unlock-block),
+    security-admin: (var-get security-admin),
+    next-event-id: (var-get next-event-id),
+    max-oracle-staleness: MAX_ORACLE_STALENESS,
+    multi-sig-threshold: MULTI_SIG_THRESHOLD,
+    time-lock-duration: TIME_LOCK_DURATION,
+    circuit-breaker-threshold: CIRCUIT_BREAKER_THRESHOLD,
+    security-event-log-size: SECURITY_EVENT_LOG_SIZE
+  })
+)
+
+;; Get batch operation limits
+(define-read-only (get-batch-limits)
+  (ok {
+    max-feeds-per-oracle: MAX_FEEDS_PER_ORACLE,
+    oracle-blacklist-timeout: ORACLE_BLACKLIST_TIMEOUT,
+    batch-submit-limit: u5,
+    batch-finalize-limit: u5,
+    batch-slash-limit: u5
+  })
+)
 
 ;; private functions
 
